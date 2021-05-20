@@ -116,9 +116,9 @@ func (s *Silencer) Mutes(lset model.LabelSet) bool {
 	activeIDs, pendingIDs, markerVersion, _ := s.marker.Silenced(fp)
 
 	var (
-		err                              error
-		allSils, activeSils, pendingSils []*pb.Silence
-		newVersion                       = markerVersion
+		err        error
+		allSils    []*pb.Silence
+		newVersion = markerVersion
 	)
 	if markerVersion == s.silences.Version() {
 		totalSilences := len(activeIDs) + len(pendingIDs)
@@ -152,54 +152,30 @@ func (s *Silencer) Mutes(lset model.LabelSet) bool {
 		level.Error(s.logger).Log("msg", "Querying silences failed, alerts might not get silenced correctly", "err", err)
 	}
 	if len(allSils) == 0 {
+		// Easy case, neither active nor pending silences anymore.
 		s.marker.SetSilenced(fp, newVersion, nil, nil)
 		return false
 	}
+	// In still possible that nothing has changed, but finding out is not
+	// much less effort than just recreating the IDs from the query
+	// result. So let's do it in any case. Note that we cannot reuse the
+	// current ID slices for concurrency reasons.
+	activeIDs, pendingIDs = nil, nil
 	for _, sil := range allSils {
 		switch getState(sil, s.silences.now()) {
 		case types.SilenceStatePending:
-			pendingSils = append(pendingSils, sil)
+			pendingIDs = append(pendingIDs, sil.Id)
 		case types.SilenceStateActive:
-			activeSils = append(activeSils, sil)
+			activeIDs = append(activeIDs, sil.Id)
 		default:
 			// Do nothing, silence has expired in the meantime.
 		}
 	}
-	idsChanged := len(activeSils) != len(activeIDs) || len(pendingSils) != len(pendingIDs)
-	if !idsChanged {
-		// Length is the same, but is the content the same?
-		for i, s := range activeSils {
-			if activeIDs[i] != s.Id {
-				idsChanged = true
-				break
-			}
-		}
-		if !idsChanged {
-			for i, s := range pendingSils {
-				if pendingIDs[i] != s.Id {
-					idsChanged = true
-					break
-				}
-			}
-		}
-	}
-	if idsChanged {
-		// Need to recreate IDs.
-		activeIDs = make([]string, len(activeSils))
-		for i, s := range activeSils {
-			activeIDs[i] = s.Id
-		}
-		sort.Strings(activeIDs) // For comparability.
-		pendingIDs = make([]string, len(pendingSils))
-		for i, s := range pendingSils {
-			pendingIDs[i] = s.Id
-		}
-		sort.Strings(pendingIDs) // For comparability.
-	}
-	if idsChanged || newVersion != markerVersion {
-		// Update marker only if something has changed.
-		s.marker.SetSilenced(fp, newVersion, activeIDs, pendingIDs)
-	}
+	sort.Strings(activeIDs)
+	sort.Strings(pendingIDs)
+
+	s.marker.SetSilenced(fp, newVersion, activeIDs, pendingIDs)
+
 	return len(activeIDs) > 0
 }
 

@@ -113,17 +113,19 @@ func NewSilencer(s *Silences, m types.Marker, l log.Logger) *Silencer {
 // Mutes implements the Muter interface.
 func (s *Silencer) Mutes(lset model.LabelSet) bool {
 	fp := lset.Fingerprint()
-	ids, markerVersion, _ := s.marker.Silenced(fp)
+	activeIDs, pendingIDs, markerVersion, _ := s.marker.Silenced(fp)
 
 	var (
-		err        error
-		sils       []*pb.Silence
-		newVersion = markerVersion
+		err                              error
+		allSils, activeSils, pendingSils []*pb.Silence
+		newVersion                       = markerVersion
 	)
 	if markerVersion == s.silences.Version() {
+		totalSilences := len(activeIDs) + len(pendingIDs)
 		// No new silences added, just need to check which of the old
-		// silences are still relevant.
-		if len(ids) == 0 {
+		// silences are still relevant and which of the pending ones
+		// have become active.
+		if totalSilences == 0 {
 			// Super fast path: No silences ever applied to this
 			// alert, none have been added. We are done.
 			return false
@@ -134,47 +136,71 @@ func (s *Silencer) Mutes(lset model.LabelSet) bool {
 		// markerVersion because the Query call might already return a
 		// newer version, which is not the version our old list of
 		// applicable silences is based on.
-		sils, _, err = s.silences.Query(
-			QIDs(ids...),
-			QState(types.SilenceStateActive),
+		allIDs := append(append(make([]string, 0, totalSilences), activeIDs...), pendingIDs...)
+		allSils, _, err = s.silences.Query(
+			QIDs(allIDs...),
+			QState(types.SilenceStateActive, types.SilenceStatePending),
 		)
 	} else {
 		// New silences have been added, do a full query.
-		sils, newVersion, err = s.silences.Query(
-			QState(types.SilenceStateActive),
+		allSils, newVersion, err = s.silences.Query(
+			QState(types.SilenceStateActive, types.SilenceStatePending),
 			QMatches(lset),
 		)
 	}
 	if err != nil {
 		level.Error(s.logger).Log("msg", "Querying silences failed, alerts might not get silenced correctly", "err", err)
 	}
-	if len(sils) == 0 {
-		s.marker.SetSilenced(fp, newVersion)
+	if len(allSils) == 0 {
+		s.marker.SetSilenced(fp, newVersion, nil, nil)
 		return false
 	}
-	idsChanged := len(sils) != len(ids)
+	for _, sil := range allSils {
+		switch getState(sil, s.silences.now()) {
+		case types.SilenceStatePending:
+			pendingSils = append(pendingSils, sil)
+		case types.SilenceStateActive:
+			activeSils = append(activeSils, sil)
+		default:
+			// Do nothing, silence has expired in the meantime.
+		}
+	}
+	idsChanged := len(activeSils) != len(activeIDs) || len(pendingSils) != len(pendingIDs)
 	if !idsChanged {
 		// Length is the same, but is the content the same?
-		for i, s := range sils {
-			if ids[i] != s.Id {
+		for i, s := range activeSils {
+			if activeIDs[i] != s.Id {
 				idsChanged = true
 				break
 			}
 		}
+		if !idsChanged {
+			for i, s := range pendingSils {
+				if pendingIDs[i] != s.Id {
+					idsChanged = true
+					break
+				}
+			}
+		}
 	}
 	if idsChanged {
-		// Need to recreate ids.
-		ids = make([]string, len(sils))
-		for i, s := range sils {
-			ids[i] = s.Id
+		// Need to recreate IDs.
+		activeIDs = make([]string, len(activeSils))
+		for i, s := range activeSils {
+			activeIDs[i] = s.Id
 		}
-		sort.Strings(ids) // For comparability.
+		sort.Strings(activeIDs) // For comparability.
+		pendingIDs = make([]string, len(pendingSils))
+		for i, s := range pendingSils {
+			pendingIDs[i] = s.Id
+		}
+		sort.Strings(pendingIDs) // For comparability.
 	}
 	if idsChanged || newVersion != markerVersion {
-		// Update marker only if something changed.
-		s.marker.SetSilenced(fp, newVersion, ids...)
+		// Update marker only if something has changed.
+		s.marker.SetSilenced(fp, newVersion, activeIDs, pendingIDs)
 	}
-	return true
+	return len(activeIDs) > 0
 }
 
 // Silences holds a silence state that can be modified, queried, and snapshot.
